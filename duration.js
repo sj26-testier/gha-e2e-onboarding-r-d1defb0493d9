@@ -4,6 +4,6 @@ export function formatDuration(seconds) {
   }
 
   const minutes = Math.floor(seconds / 60);
-  const remainder = String(seconds % 60).padStart(2, '0');
+  const remainder = String(seconds % 60);
   return `${minutes}:${remainder}`;
 }
