@@ -1,0 +1,8 @@
+{
+  "name": "gha-e2e-basic",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}
