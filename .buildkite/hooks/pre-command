@@ -6,31 +6,58 @@ if [[ "${BUILDKITE_STEP_KEY:-}" != capture-importer ]]; then
 fi
 
 CAPTURE_REAL_AGENT="$(command -v buildkite-agent)"
-export CAPTURE_REAL_AGENT
-export CAPTURE_ROOT="${BUILDKITE_BUILD_CHECKOUT_PATH}/.lab-capture"
+CAPTURE_REAL_MISE="$(command -v mise)"
+CAPTURE_AGENT_ENDPOINT="$BUILDKITE_AGENT_ENDPOINT"
+CAPTURE_ROOT="${BUILDKITE_BUILD_CHECKOUT_PATH}/.lab-capture/${BUILDKITE_JOB_ID}-${BUILDKITE_RETRY_COUNT:-0}"
+CAPTURE_HELPER="${BUILDKITE_BUILD_CHECKOUT_PATH}/.buildkite/capture_agent_resolvers.py"
+export CAPTURE_REAL_AGENT CAPTURE_REAL_MISE CAPTURE_AGENT_ENDPOINT CAPTURE_ROOT CAPTURE_HELPER
+
+mise_version="$("$CAPTURE_REAL_MISE" version | head -1 | awk '{print $1}')"
+if [[ "$(printf '%s\n' 2026.10.17 "$mise_version" | sort -V | head -1)" != 2026.10.17 ]]; then
+  echo 'Capture requires mise >=2026.10.17; no shared installation was changed' >&2
+  exit 1
+fi
+umask 077
 mkdir -p "$CAPTURE_ROOT/bin"
 cp .github/workflows/capture.yml "$CAPTURE_ROOT/source.yml"
-printf 'producer_job_id=%s\nbuild_id=%s\ncommit=%s\nbranch=%s\nsource=%s\nevent=%s\nruntime_version=0.104.1\n' \
+printf 'producer_job_id=%s\nbuild_id=%s\ncommit=%s\nbranch=%s\nsource=%s\nevent=%s\nruntime_version=0.104.1\nmise_version=%s\n' \
   "$BUILDKITE_JOB_ID" "$BUILDKITE_BUILD_ID" "$BUILDKITE_COMMIT" \
-  "$BUILDKITE_BRANCH" "$BUILDKITE_SOURCE" "${BUILDKITE_GITHUB_EVENT:-}" > "$CAPTURE_ROOT/producer.txt"
-cat > "$CAPTURE_ROOT/bin/buildkite-agent" <<'WRAPPER'
+  "$BUILDKITE_BRANCH" "$BUILDKITE_SOURCE" "${BUILDKITE_GITHUB_EVENT:-}" "$mise_version" > "$CAPTURE_ROOT/producer.txt"
+
+cat > "$CAPTURE_ROOT/bin/buildkite-agent" <<'AGENT'
 #!/usr/bin/env bash
 set -euo pipefail
+export BUILDKITE_AGENT_ENDPOINT="$CAPTURE_AGENT_ENDPOINT"
 if [[ "${1:-}" == pipeline && "${2:-}" == upload ]]; then
-  test ! -e "$CAPTURE_ROOT/pipeline.yml"
-  cat > "$CAPTURE_ROOT/pipeline.yml"
-  printf '%s\n' "$@" > "$CAPTURE_ROOT/upload-arguments.txt"
+  upload="$(mktemp -d "$CAPTURE_ROOT/upload-XXXXXXXX")"
+  cat > "$upload/pipeline.yml"
+  printf '%s\n' "$@" > "$upload/arguments.txt"
   status=0
-  "$CAPTURE_REAL_AGENT" "$@" < "$CAPTURE_ROOT/pipeline.yml" || status=$?
-  printf '%s\n' "$status" > "$CAPTURE_ROOT/upload-exit-status.txt"
-  (
-    cd "$CAPTURE_ROOT"
-    sha256sum pipeline.yml source.yml producer.txt upload-arguments.txt upload-exit-status.txt > SHA256SUMS
-    "$CAPTURE_REAL_AGENT" artifact upload 'pipeline.yml;source.yml;producer.txt;upload-arguments.txt;upload-exit-status.txt;SHA256SUMS' >&2
-  )
+  "$CAPTURE_REAL_AGENT" "$@" < "$upload/pipeline.yml" || status=$?
+  printf '%s\n' "$status" > "$upload/exit-status.txt"
   exit "$status"
 fi
 exec "$CAPTURE_REAL_AGENT" "$@"
-WRAPPER
-chmod 700 "$CAPTURE_ROOT/bin/buildkite-agent"
+AGENT
+
+cat > "$CAPTURE_ROOT/bin/mise" <<'MISE'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$#" == 6 && "$*" == '--no-config exec github:buildkite/buildkite-gha@0.104.1 -- buildkite-gha plugin' ]]; then
+  printf '%s\n' 'released importer child selected' > "$CAPTURE_ROOT/wrapper-selected.txt"
+  status=0
+  BUILDKITE_AGENT_ENDPOINT="$CAPTURE_AGENT_ENDPOINT" python3 "$CAPTURE_HELPER" "$CAPTURE_ROOT" -- "$CAPTURE_REAL_MISE" "$@" || status=$?
+  (
+    export BUILDKITE_AGENT_ENDPOINT="$CAPTURE_AGENT_ENDPOINT"
+    cd "$CAPTURE_ROOT"
+    # SHA256SUMS is explicitly excluded from find's input.
+    # shellcheck disable=SC2094
+    find . -type f -not -path './bin/*' -not -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+    "$CAPTURE_REAL_AGENT" artifact upload 'source.yml;producer.txt;wrapper-selected.txt;agent-inputs.json;upload-*/*;SHA256SUMS' >&2
+  ) || echo 'Black-box capture artifact upload failed; importer exit status preserved' >&2
+  exit "$status"
+fi
+exec "$CAPTURE_REAL_MISE" "$@"
+MISE
+chmod 700 "$CAPTURE_ROOT/bin/buildkite-agent" "$CAPTURE_ROOT/bin/mise"
 export PATH="$CAPTURE_ROOT/bin:$PATH"
