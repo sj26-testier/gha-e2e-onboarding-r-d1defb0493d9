@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${BUILDKITE_STEP_KEY:-}" != capture-importer ]]; then
+  return 0
+fi
+
+CAPTURE_REAL_AGENT="$(command -v buildkite-agent)"
+export CAPTURE_REAL_AGENT
+export CAPTURE_ROOT="${BUILDKITE_BUILD_CHECKOUT_PATH}/.lab-capture"
+mkdir -p "$CAPTURE_ROOT/bin"
+cp .github/workflows/capture.yml "$CAPTURE_ROOT/source.yml"
+printf 'producer_job_id=%s\nbuild_id=%s\ncommit=%s\nbranch=%s\nsource=%s\nevent=%s\nruntime_version=0.104.1\n' \
+  "$BUILDKITE_JOB_ID" "$BUILDKITE_BUILD_ID" "$BUILDKITE_COMMIT" \
+  "$BUILDKITE_BRANCH" "$BUILDKITE_SOURCE" "${BUILDKITE_GITHUB_EVENT:-}" > "$CAPTURE_ROOT/producer.txt"
+cat > "$CAPTURE_ROOT/bin/buildkite-agent" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == pipeline && "${2:-}" == upload ]]; then
+  test ! -e "$CAPTURE_ROOT/pipeline.yml"
+  cat > "$CAPTURE_ROOT/pipeline.yml"
+  printf '%s\n' "$@" > "$CAPTURE_ROOT/upload-arguments.txt"
+  status=0
+  "$CAPTURE_REAL_AGENT" "$@" < "$CAPTURE_ROOT/pipeline.yml" || status=$?
+  printf '%s\n' "$status" > "$CAPTURE_ROOT/upload-exit-status.txt"
+  (
+    cd "$CAPTURE_ROOT"
+    sha256sum pipeline.yml source.yml producer.txt upload-arguments.txt upload-exit-status.txt > SHA256SUMS
+    "$CAPTURE_REAL_AGENT" artifact upload 'pipeline.yml;source.yml;producer.txt;upload-arguments.txt;upload-exit-status.txt;SHA256SUMS' >&2
+  )
+  exit "$status"
+fi
+exec "$CAPTURE_REAL_AGENT" "$@"
+WRAPPER
+chmod 700 "$CAPTURE_ROOT/bin/buildkite-agent"
+export PATH="$CAPTURE_ROOT/bin:$PATH"
