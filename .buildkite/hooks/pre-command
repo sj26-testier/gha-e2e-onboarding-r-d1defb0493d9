@@ -6,23 +6,39 @@ if [[ "${BUILDKITE_STEP_KEY:-}" != capture-importer ]]; then
 fi
 
 CAPTURE_REAL_AGENT="$(command -v buildkite-agent)"
-CAPTURE_REAL_MISE="$(command -v mise)"
+CAPTURE_REAL_MISE="$(command -v mise || true)"
 CAPTURE_AGENT_ENDPOINT="$BUILDKITE_AGENT_ENDPOINT"
 CAPTURE_ROOT="${BUILDKITE_BUILD_CHECKOUT_PATH}/.lab-capture/${BUILDKITE_JOB_ID}-${BUILDKITE_RETRY_COUNT:-0}"
 CAPTURE_HELPER="${BUILDKITE_BUILD_CHECKOUT_PATH}/.buildkite/capture_agent_resolvers.py"
 export CAPTURE_REAL_AGENT CAPTURE_REAL_MISE CAPTURE_AGENT_ENDPOINT CAPTURE_ROOT CAPTURE_HELPER
 
-mise_version="$("$CAPTURE_REAL_MISE" version | head -1 | awk '{print $1}')"
-if [[ "$(printf '%s\n' 2026.10.17 "$mise_version" | sort -V | head -1)" != 2026.10.17 ]]; then
-  echo 'Capture requires mise >=2026.10.17; no shared installation was changed' >&2
-  exit 1
-fi
 umask 077
 mkdir -p "$CAPTURE_ROOT/bin"
+export MISE_DATA_DIR="$CAPTURE_ROOT/mise-data"
+export XDG_CACHE_HOME="$CAPTURE_ROOT/cache"
+export XDG_STATE_HOME="$CAPTURE_ROOT/state"
+path_mise_version="$("$CAPTURE_REAL_MISE" version 2>/dev/null || true)"
+if [[ "$path_mise_version" =~ v?([0-9]{4}\.[0-9]+\.[0-9]+) ]]; then
+  path_mise_version="${BASH_REMATCH[1]}"
+else
+  path_mise_version=unknown
+fi
+if [[ "$path_mise_version" == unknown || "$(printf '%s\n' 2026.10.17 "$path_mise_version" | sort -V | head -1)" != 2026.10.17 ]]; then
+  # Same qualified release and archive digest as the pinned plugin's lib/mise.sh.
+  test "$(uname -sm)" = 'Linux x86_64'
+  curl --disable --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 120 \
+    https://github.com/jdx/mise/releases/download/v2026.10.17/mise-v2026.10.17-linux-x64-musl.tar.gz -o "$CAPTURE_ROOT/mise.tar.gz"
+  echo "54dc5f1a0de14bddf70a4d8273603647c140eedd8b9d083a8f73ca13a9a82f53  $CAPTURE_ROOT/mise.tar.gz" | sha256sum --check --status
+  env -u TAR_OPTIONS -u GZIP tar -xzf "$CAPTURE_ROOT/mise.tar.gz" -C "$CAPTURE_ROOT" mise/bin/mise
+  CAPTURE_REAL_MISE="$CAPTURE_ROOT/mise/bin/mise"
+  rm "$CAPTURE_ROOT/mise.tar.gz"
+fi
+mise_version="$("$CAPTURE_REAL_MISE" version | head -1 | awk '{print $1}')"
+mise_digest="$(sha256sum "$CAPTURE_REAL_MISE" | cut -d ' ' -f1)"
 cp .github/workflows/capture.yml "$CAPTURE_ROOT/source.yml"
-printf 'producer_job_id=%s\nbuild_id=%s\ncommit=%s\nbranch=%s\nsource=%s\nevent=%s\nruntime_version=0.104.1\nmise_version=%s\n' \
+printf 'producer_job_id=%s\nbuild_id=%s\ncommit=%s\nbranch=%s\nsource=%s\nevent=%s\nruntime_version=0.104.1\nmise_version=%s\npath_mise_version=%s\nmise_sha256=%s\nmise_data_scope=job-local\nxdg_cache_scope=job-local\nxdg_state_scope=job-local\n' \
   "$BUILDKITE_JOB_ID" "$BUILDKITE_BUILD_ID" "$BUILDKITE_COMMIT" \
-  "$BUILDKITE_BRANCH" "$BUILDKITE_SOURCE" "${BUILDKITE_GITHUB_EVENT:-}" "$mise_version" > "$CAPTURE_ROOT/producer.txt"
+  "$BUILDKITE_BRANCH" "$BUILDKITE_SOURCE" "${BUILDKITE_GITHUB_EVENT:-}" "$mise_version" "$path_mise_version" "$mise_digest" > "$CAPTURE_ROOT/producer.txt"
 
 cat > "$CAPTURE_ROOT/bin/buildkite-agent" <<'AGENT'
 #!/usr/bin/env bash
@@ -50,9 +66,10 @@ if [[ "$#" == 6 && "$*" == '--no-config exec github:buildkite/buildkite-gha@0.10
   (
     export BUILDKITE_AGENT_ENDPOINT="$CAPTURE_AGENT_ENDPOINT"
     cd "$CAPTURE_ROOT"
-    # SHA256SUMS is explicitly excluded from find's input.
-    # shellcheck disable=SC2094
-    find . -type f -not -path './bin/*' -not -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+    shopt -s nullglob
+    for file in source.yml producer.txt wrapper-selected.txt agent-inputs.json upload-*/*; do
+      if [[ -f "$file" ]]; then sha256sum "$file"; fi
+    done > SHA256SUMS
     "$CAPTURE_REAL_AGENT" artifact upload 'source.yml;producer.txt;wrapper-selected.txt;agent-inputs.json;upload-*/*;SHA256SUMS' >&2
   ) || echo 'Black-box capture artifact upload failed; importer exit status preserved' >&2
   exit "$status"
